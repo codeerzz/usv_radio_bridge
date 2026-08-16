@@ -1,0 +1,33 @@
+radio_bridge_node:
+  ros__parameters:
+    # ── Serial link ──────────────────────────────────────────────────────
+    serial_port: "/dev/ttyUSB0"
+    baud_rate: 115200
+    radio_timeout: 2.0        # [s] no bytes received this long -> log link-down warning
+
+    # ── TX scheduling ────────────────────────────────────────────────────
+    tx_rate_hz: 50.0           # frame drain rate off the priority TX queues
+    telemetry_rate_hz: 10.0    # TELEMETRY rebuild rate (bounds effective telemetry TX rate)
+
+    # ── Remote control (CONTROL/KILLSWITCH -> cmd_vel/killswitch) ───────
+    # Deliberately false: the Python reference (navi_gui/telemetry_sender.py)
+    # defaulted this to true, which contradicted its own startup log message
+    # ("set publish_remote_control:=true after topic verification") — that
+    # was a bug, not a feature. Flip to true only after the radio link and
+    # topic wiring have been verified on the bench.
+    publish_remote_control: false
+    cmd_vel_topic: "/cmd_vel"
+    killswitch_topic: "/navi/killswitch"
+    max_linear_speed: 1.0
+    max_angular_speed: 1.0
+    gamepad_button_count: 16   # pre-created Bool publishers: radio/gamepad/button_0..N-1
+
+    # ── Telemetry source topics ──────────────────────────────────────────
+    position_topic: "/filter/positionlla"
+    euler_topic: "/filter/euler"
+    velocity_topic: "/filter/velocity"
+    imu_topic: "/imu/data"
+    gnss_topic: "/gnss"
+    battery_topic: "/ap/battery"
+    nmea_topic: "/nmea"
+    control_mode_topic: "gnc/control_mode"

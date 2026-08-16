@@ -1,0 +1,13 @@
+# Request a control-mode change on mode_mux_node (the sole GNC mode arbiter).
+#
+# This is a second entry point onto the exact same _set_mode() path the
+# gamepad's auto/manual buttons already use — it does not decide anything
+# itself, it just asks the mux to switch, so all existing safety behaviour
+# (Nav2 goal cancellation on AUTO->MANUAL, etc.) still applies unchanged.
+
+string mode                     # requested mode: "AUTO" or "MANUAL"
+---
+bool success                    # false only if `mode` was neither AUTO nor MANUAL
+string message                  # "ok", or the rejection reason
+string mode                     # resulting gnc/control_mode value after this call
+                                 # (unchanged from before the call if rejected)

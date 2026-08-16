@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>usv_radio_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    RFD900x serial telemetry-radio bridge to the ground-station GUI. Binary
+    framed TX/RX on a dedicated reader thread with a priority-ordered TX
+    queue, replacing ARACPC/navi_vehicle/navi_gui's Python telemetry_sender.py
+    reference with an idiomatic rclcpp node (smaller telemetry payload, no
+    JSON command payloads, and GUI-driven autonomy mode arbitration against
+    usv_gnc's mode_mux_node). Never a required dependency for autonomous
+    operation — see usv_bringup.launch.py's radio_bridge:=false argument.
+  </description>
+  <maintainer email="a_metehan-tr@hotmail.com">navida</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nmea_msgs</depend>
+  <depend>mavros_msgs</depend>
+  <depend>usv_gnc_msgs</depend>
+  <depend>zlib</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
