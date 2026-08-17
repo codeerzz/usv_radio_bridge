@@ -22,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -50,11 +51,27 @@ private:
   double telemetry_rate_hz_ = 10.0;
   double radio_timeout_ = 2.0;
   bool publish_remote_control_ = false;
-  std::string cmd_vel_topic_;
   std::string killswitch_topic_;
   double max_linear_speed_ = 1.0;
   double max_angular_speed_ = 1.0;
   int gamepad_button_count_ = 16;
+
+  // ---- Joy output ---------------------------------------------------------
+  // The radio publishes sensor_msgs/Joy on the SAME topic as the physical
+  // gamepad, so it enters the existing chain instead of bypassing it:
+  //
+  //   /joy -> mode_mux_node  (A=AUTO, B=MANUAL)      -> gnc/control_mode
+  //        -> rc_teleop_node (sticks + LB deadman)   -> /gnc/ap_joy_manual
+  //   mode_mux picks manual|auto                     -> /ap/joy
+  //
+  // Writing /cmd_vel directly (what this node did before) went around
+  // mode_mux entirely: the radio could drive the boat while the mux still
+  // believed it was in AUTO, and the deadman did not apply. Feeding /joy keeps
+  // mode_mux the sole arbiter and gets the deadman for free.
+  std::string joy_topic_;
+  int joy_axis_count_ = 8;
+  int joy_surge_axis_ = 1;   // must match rc_teleop_node's surge_axis
+  int joy_yaw_axis_ = 3;     // must match rc_teleop_node's yaw_axis
 
   // ---- ROS I/O -------------------------------------------------------------
   rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr position_sub_;
@@ -67,8 +84,18 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr control_mode_sub_;
 
   rclcpp::Publisher<mavros_msgs::msg::RTCM>::SharedPtr rtcm_pub_;
-  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr joy_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr killswitch_pub_;
+
+  /// Latest stick/button state, published as one Joy on every CONTROL frame
+  /// and on every button change. Buttons must persist across CONTROL frames
+  /// (the deadman is held down while the sticks move), so the state is kept
+  /// here rather than rebuilt per frame. Guarded by joy_mutex_ because CONTROL
+  /// and GAMEPAD_BUTTON are both handled on the serial reader thread but the
+  /// killswitch failsafe can zero it from elsewhere.
+  std::mutex joy_mutex_;
+  sensor_msgs::msg::Joy joy_state_;
+  void publishJoyLocked();
   // Fixed-size, pre-created at startup (see constructor) rather than created
   // on demand from the reader thread: bounds resource usage against a
   // garbled/out-of-range button_index and avoids calling create_publisher()

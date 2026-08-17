@@ -1,7 +1,15 @@
 radio_bridge_node:
   ros__parameters:
     # ── Serial link ──────────────────────────────────────────────────────
-    serial_port: "/dev/ttyUSB0"
+    # By-id, NOT /dev/ttyUSB*. Two USB serial devices are plugged into this
+    # Jetson and ttyUSB numbering follows enumeration order, so it moves:
+    #   usb-FTDI_FT232R_USB_UART_BG00HPDP    = the RFD900x radio   (this one)
+    #   usb-Xsens_MTi_USB_Converter_DB9YBG0T = the MTi-680G IMU
+    # This was shipped as "/dev/ttyUSB0", which on 2026-08-17 was the XSENS —
+    # so the bridge opened the IMU's port and raced the xsens driver for it,
+    # while reporting "radio serial port opened" and never seeing a radio byte.
+    # The by-id path is bound to the FTDI chip's serial number and cannot swap.
+    serial_port: "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG00HPDP-if00-port0"
     baud_rate: 115200
     radio_timeout: 2.0        # [s] no bytes received this long -> log link-down warning
 
@@ -9,18 +17,51 @@ radio_bridge_node:
     tx_rate_hz: 50.0           # frame drain rate off the priority TX queues
     telemetry_rate_hz: 10.0    # TELEMETRY rebuild rate (bounds effective telemetry TX rate)
 
-    # ── Remote control (CONTROL/KILLSWITCH -> cmd_vel/killswitch) ───────
-    # Deliberately false: the Python reference (navi_gui/telemetry_sender.py)
-    # defaulted this to true, which contradicted its own startup log message
-    # ("set publish_remote_control:=true after topic verification") — that
-    # was a bug, not a feature. Flip to true only after the radio link and
-    # topic wiring have been verified on the bench.
-    publish_remote_control: false
-    cmd_vel_topic: "/cmd_vel"
+    # ── Remote control (CONTROL/KILLSWITCH -> /joy + killswitch) ────────
+    # Shipped false upstream, with the reasoning that the Python reference
+    # (navi_gui/telemetry_sender.py) defaulted it to true while its own startup
+    # log said "set publish_remote_control:=true after topic verification" — a
+    # contradiction upstream called a bug rather than a feature.
+    #
+    # 2026-08-17: turned ON deliberately. With it false the radio receives
+    # CONTROL and KILLSWITCH frames but acts on neither, so the ground station's
+    # emergency stop does nothing — for a boat that can be under way on its own,
+    # a dead kill switch is the worse of the two risks.
+    #
+    # This makes the radio a live control input. Before the first time on the
+    # water, verify ON THE BENCH, with the propellers clear:
+    #   ros2 topic echo /navi/killswitch     <- press the GUI kill switch
+    #   ros2 topic echo /joy                 <- move the GUI sticks / buttons
+    #   ros2 topic echo gnc/control_mode     <- GUI button B should give MANUAL
+    #   ros2 topic echo /ap/joy              <- what actually reaches ArduPilot
+    # If any of them stays silent the link is not wired the way you think.
+    publish_remote_control: true
     killswitch_topic: "/navi/killswitch"
     max_linear_speed: 1.0
     max_angular_speed: 1.0
     gamepad_button_count: 16   # pre-created Bool publishers: radio/gamepad/button_0..N-1
+
+    # ── Joy output ──────────────────────────────────────────────────────
+    # The radio publishes on the SAME topic as the physical gamepad, so it
+    # feeds the existing chain rather than bypassing it:
+    #
+    #   /joy -> mode_mux_node  (button 0 = A = AUTO, button 1 = B = MANUAL)
+    #        -> rc_teleop_node (surge/yaw axes, button 4 = LB = deadman)
+    #                                          -> /gnc/ap_joy_manual
+    #   mode_mux picks manual|auto             -> /ap/joy -> ArduPilot
+    #
+    # It used to publish geometry_msgs/Twist on /cmd_vel, which went AROUND
+    # mode_mux: the radio could drive the boat while the mux still thought it
+    # was in AUTO, and the deadman never applied. Feeding /joy keeps mode_mux
+    # the sole arbiter and inherits the deadman.
+    #
+    # These indices MUST match rc_teleop_node's surge_axis / yaw_axis and
+    # mode_mux_node's manual_button / auto_button. Out-of-range values are
+    # rejected at startup rather than corrupting the message.
+    joy_topic: "/joy"
+    joy_axis_count: 8          # standard Xbox layout; sized to fit the indices below
+    joy_surge_axis: 1          # rc_teleop_node surge_axis (left stick vertical)
+    joy_yaw_axis: 3            # rc_teleop_node yaw_axis   (right stick horizontal)
 
     # ── Telemetry source topics ──────────────────────────────────────────
     position_topic: "/filter/positionlla"

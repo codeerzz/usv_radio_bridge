@@ -52,8 +52,10 @@ RadioBridgeNode::RadioBridgeNode()
     serial_port_.c_str(), baud_rate_, tx_rate_hz_, telemetry_rate_hz_, radio_timeout_);
   if (publish_remote_control_) {
     RCLCPP_WARN(get_logger(),
-      "publish_remote_control ENABLED: CONTROL/KILLSWITCH frames will drive %s/%s",
-      cmd_vel_topic_.c_str(), killswitch_topic_.c_str());
+      "publish_remote_control ENABLED: sticks+buttons -> %s (surge axis %d, yaw axis %d), "
+      "killswitch -> %s. The radio now enters the SAME chain as the physical gamepad: "
+      "mode_mux_node arbitrates the mode and rc_teleop_node's deadman applies",
+      joy_topic_.c_str(), joy_surge_axis_, joy_yaw_axis_, killswitch_topic_.c_str());
   } else {
     RCLCPP_WARN(get_logger(),
       "publish_remote_control disabled (default) — CONTROL/KILLSWITCH frames are received "
@@ -83,11 +85,15 @@ void RadioBridgeNode::declare_and_read_parameters()
   // for why the Python reference's default of true was a bug, not a
   // feature, and is not being carried forward.
   publish_remote_control_ = this->declare_parameter<bool>("publish_remote_control", false);
-  cmd_vel_topic_ = this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
   killswitch_topic_ = this->declare_parameter<std::string>("killswitch_topic", "/navi/killswitch");
   max_linear_speed_ = this->declare_parameter<double>("max_linear_speed", 1.0);
   max_angular_speed_ = this->declare_parameter<double>("max_angular_speed", 1.0);
   gamepad_button_count_ = this->declare_parameter<int>("gamepad_button_count", 16);
+
+  joy_topic_ = this->declare_parameter<std::string>("joy_topic", "/joy");
+  joy_axis_count_ = this->declare_parameter<int>("joy_axis_count", 8);
+  joy_surge_axis_ = this->declare_parameter<int>("joy_surge_axis", 1);
+  joy_yaw_axis_ = this->declare_parameter<int>("joy_yaw_axis", 3);
 
   this->declare_parameter<std::string>("position_topic", "/filter/positionlla");
   this->declare_parameter<std::string>("euler_topic", "/filter/euler");
@@ -107,13 +113,36 @@ void RadioBridgeNode::declare_and_read_parameters()
   if (gamepad_button_count_ < 0) {
     throw std::invalid_argument("gamepad_button_count must be >= 0");
   }
+  // The axis indices address joy_state_.axes directly; a bad one would be an
+  // out-of-range write on the reader thread. Reject at startup instead.
+  if (joy_axis_count_ <= 0) {
+    throw std::invalid_argument("joy_axis_count must be > 0");
+  }
+  if (joy_surge_axis_ < 0 || joy_surge_axis_ >= joy_axis_count_) {
+    throw std::invalid_argument("joy_surge_axis out of range for joy_axis_count");
+  }
+  if (joy_yaw_axis_ < 0 || joy_yaw_axis_ >= joy_axis_count_) {
+    throw std::invalid_argument("joy_yaw_axis out of range for joy_axis_count");
+  }
 }
 
 void RadioBridgeNode::create_publishers()
 {
   rtcm_pub_ = this->create_publisher<mavros_msgs::msg::RTCM>("/rtcm", 50);
-  cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+  joy_pub_ = this->create_publisher<sensor_msgs::msg::Joy>(joy_topic_, 10);
   killswitch_pub_ = this->create_publisher<std_msgs::msg::Bool>(killswitch_topic_, 10);
+
+  std::lock_guard<std::mutex> lock(joy_mutex_);
+  joy_state_.axes.assign(static_cast<std::size_t>(joy_axis_count_), 0.0F);
+  joy_state_.buttons.assign(static_cast<std::size_t>(gamepad_button_count_), 0);
+}
+
+/// Stamp and publish joy_state_. Caller must hold joy_mutex_.
+void RadioBridgeNode::publishJoyLocked()
+{
+  joy_state_.header.stamp = this->now();
+  joy_state_.header.frame_id = "radio";
+  joy_pub_->publish(joy_state_);
 }
 
 void RadioBridgeNode::create_subscriptions()
@@ -539,19 +568,26 @@ void RadioBridgeNode::handle_control(const ParsedFrame & frame)
     return;
   }
 
-  const float linear_x =
+  // Sticks go onto the SAME axes rc_teleop_node reads, so the radio looks
+  // exactly like the physical gamepad to everything downstream. max_*_speed
+  // stays a scale on the normalised stick, not a velocity: rc_teleop applies
+  // its own surge/yaw scaling, and this axis is unitless.
+  const float surge =
     std::clamp(decoded->linear_x, -1.0F, 1.0F) * static_cast<float>(max_linear_speed_);
-  const float angular_z =
+  const float yaw =
     std::clamp(decoded->angular_z, -1.0F, 1.0F) * static_cast<float>(max_angular_speed_);
 
-  geometry_msgs::msg::Twist msg;
-  msg.linear.x = linear_x;
-  msg.angular.z = angular_z;
-  cmd_vel_pub_->publish(msg);
+  {
+    std::lock_guard<std::mutex> lock(joy_mutex_);
+    joy_state_.axes[static_cast<std::size_t>(joy_surge_axis_)] = surge;
+    joy_state_.axes[static_cast<std::size_t>(joy_yaw_axis_)] = yaw;
+    publishJoyLocked();
+  }
 
   RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-    "REMOTE CONTROL RX #%u: linear.x=%.3f angular.z=%.3f",
-    static_cast<unsigned int>(frame.sequence), linear_x, angular_z);
+    "REMOTE CONTROL RX #%u: surge(axis %d)=%.3f yaw(axis %d)=%.3f",
+    static_cast<unsigned int>(frame.sequence), joy_surge_axis_, surge,
+    joy_yaw_axis_, yaw);
 }
 
 void RadioBridgeNode::handle_killswitch(const ParsedFrame & frame)
@@ -574,9 +610,15 @@ void RadioBridgeNode::handle_killswitch(const ParsedFrame & frame)
               active ? "ACTIVE" : "RELEASED");
 
   if (active) {
-    // Immediate zero-Twist failsafe stop, same as the Python reference —
-    // don't wait for whatever last CONTROL value was cached anywhere.
-    cmd_vel_pub_->publish(geometry_msgs::msg::Twist{});
+    // Immediate failsafe: centre the sticks AND clear every button, then send
+    // it. Clearing the buttons is the part that matters — it releases the
+    // deadman, so rc_teleop_node stops the thrusters itself rather than
+    // waiting for its 0.5 s joy timeout. Zeroing the axes alone would leave
+    // the deadman held and the boat merely idling.
+    std::lock_guard<std::mutex> lock(joy_mutex_);
+    std::fill(joy_state_.axes.begin(), joy_state_.axes.end(), 0.0F);
+    std::fill(joy_state_.buttons.begin(), joy_state_.buttons.end(), 0);
+    publishJoyLocked();
   }
 }
 
@@ -595,9 +637,26 @@ void RadioBridgeNode::handle_gamepad_button(const ParsedFrame & frame)
     return;
   }
 
+  const bool pressed = (decoded->pressed != 0);
+
   std_msgs::msg::Bool msg;
-  msg.data = (decoded->pressed != 0);
+  msg.data = pressed;
   gamepad_button_pubs_[decoded->button_index]->publish(msg);
+
+  // Also fold the button into the Joy state and republish. This is what makes
+  // the GUI's mode buttons work: mode_mux_node edge-detects button 1 (B) for
+  // MANUAL and 0 (A) for AUTO on /joy, and rc_teleop_node needs button 4 (LB)
+  // held as its deadman. Gating on publish_remote_control_ deliberately: with
+  // remote control off the buttons are still reported on their Bool topics for
+  // diagnostics, but must not be able to change mode or arm the deadman.
+  if (!publish_remote_control_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(joy_mutex_);
+  if (decoded->button_index < joy_state_.buttons.size()) {
+    joy_state_.buttons[decoded->button_index] = pressed ? 1 : 0;
+    publishJoyLocked();
+  }
 }
 
 void RadioBridgeNode::handle_autonomy_command(const ParsedFrame & frame)
